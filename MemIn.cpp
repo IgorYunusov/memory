@@ -1,6 +1,5 @@
 #include "MemIn.h"
 #include <string>
-#include <algorithm>
 #include <cstdint>
 #include <Psapi.h>
 
@@ -204,7 +203,7 @@ bool MemIn::HashMD5(const uintptr_t address, const size_t size, uint8_t* const o
 
 uintptr_t MemIn::PatternScan(const char* const pattern, const char* const mask, const ScanBoundaries& scanBoundaries, const DWORD protect, const size_t numThreads, const bool firstMatch)
 {
-	std::atomic<uintptr_t> address = -1; std::atomic<size_t> finishCount = 0;
+	std::atomic<uintptr_t> address = -1;
 
 	uintptr_t start = 0, end = 0;
 	switch (scanBoundaries.scanBoundaries)
@@ -248,7 +247,7 @@ uintptr_t MemIn::PatternScan(const char* const pattern, const char* const mask, 
 	std::vector<std::thread> threads;
 
 	for (size_t i = 0; i < numThreads; i++)
-		threads.emplace_back(std::thread(&MemIn::PatternScanImpl, std::ref(address), std::ref(finishCount), reinterpret_cast<const uint8_t* const>(pattern), mask, start + chunkSize * i, start + chunkSize * (static_cast<size_t>(i) + 1), protect, firstMatch));
+		threads.emplace_back(std::thread(&MemIn::PatternScanImpl, std::ref(address), reinterpret_cast<const uint8_t* const>(pattern), mask, start + chunkSize * i, start + chunkSize * (static_cast<size_t>(i) + 1), protect, firstMatch));
 
 	for (auto& thread : threads)
 		thread.join();
@@ -256,10 +255,13 @@ uintptr_t MemIn::PatternScan(const char* const pattern, const char* const mask, 
 	return (address.load() != -1) ? address.load() : 0;
 }
 
-uintptr_t MemIn::AOBScan(const char* const AOB, const ScanBoundaries& scanBoundaries, const DWORD protect, const size_t numThreads, const bool firstMatch)
+uintptr_t MemIn::AOBScan(const char* const AOB, const ScanBoundaries& scanBoundaries, const DWORD protect, size_t* const patternSize, const size_t numThreads, const bool firstMatch)
 {
 	std::string pattern, mask;
 	AOBToPattern(AOB, pattern, mask);
+
+	if (patternSize)
+		*patternSize = pattern.size();
 
 	return PatternScan(pattern.c_str(), mask.c_str(), scanBoundaries, protect, numThreads, firstMatch);
 }
@@ -496,7 +498,7 @@ uintptr_t MemIn::FindCodeCave(const size_t size, const uint32_t nullByte, const 
 	}
 	else
 	{
-		std::atomic<uintptr_t> atomicAddress = -1; std::atomic<size_t> finishCount = 0;
+		std::atomic<uintptr_t> atomicAddress = -1;
 
 		uintptr_t start = 0, end = 0;
 		switch (scanBoundaries.scanBoundaries)
@@ -541,7 +543,7 @@ uintptr_t MemIn::FindCodeCave(const size_t size, const uint32_t nullByte, const 
 		std::vector<std::thread> threads;
 
 		for (size_t i = 0; i < numThreads; i++)
-			threads.emplace_back(std::thread(&MemIn::FindCodeCaveImpl, std::ref(atomicAddress), std::ref(finishCount), size, start + chunkSize * i, start + chunkSize * (static_cast<size_t>(i) + 1), protection, firstMatch));
+			threads.emplace_back(std::thread(&MemIn::FindCodeCaveImpl, std::ref(atomicAddress), size, start + chunkSize * i, start + chunkSize * (static_cast<size_t>(i) + 1), protection, firstMatch));
 
 		for (auto& thread : threads)
 			thread.join();
@@ -549,7 +551,7 @@ uintptr_t MemIn::FindCodeCave(const size_t size, const uint32_t nullByte, const 
 		address = (atomicAddress.load() != -1) ? atomicAddress.load() : 0;
 	}
 
-	if (codeCaveSize)
+	if (address && codeCaveSize)
 	{
 		size_t remainingSize = 0;
 		MEMORY_BASIC_INFORMATION mbi;
@@ -731,9 +733,6 @@ void MemIn::EnumModules(const DWORD processId, bool (*callback)(MODULEENTRY32& m
 //Credits to: https://guidedhacking.com/threads/universal-pattern-signature-parser.9588/ & https://guidedhacking.com/threads/python-script-to-convert-ces-aob-signature-to-c-s-signature-mask.14095/
 void MemIn::AOBToPattern(const char* const AOB, std::string& pattern, std::string& mask)
 {
-	if (!AOB)
-		return;
-
 	auto ishex = [](const char c) -> bool { return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F'); };
 	auto hexchartoint = [](const char c) -> uint8_t { return (c >= 'A') ? (c - 'A' + 10) : (c - '0'); };
 
@@ -747,8 +746,21 @@ void MemIn::AOBToPattern(const char* const AOB, std::string& pattern, std::strin
 	}
 }
 
+void MemIn::PatternToAOB(const char* const pattern, const char* const mask, std::string& AOB)
+{
+	for (size_t i = 0; mask[i]; i++)
+	{
+		if (mask[i] == '?')
+			AOB += "??";
+		else
+			AOB += static_cast<char>((pattern[i] & 0xF0) >> 4) + static_cast<char>(pattern[i] & 0x0F);
+
+		AOB += ' ';
+	}
+}
+
 //Inspired by https://github.com/cheat-engine/cheat-engine/blob/ac072b6fae1e0541d9e54e2b86452507dde4689a/Cheat%20Engine/ceserver/native-api.c
-void MemIn::PatternScanImpl(std::atomic<uintptr_t>& address, std::atomic<size_t>& finishCount, const uint8_t* const pattern, const char* const mask, uintptr_t start, const uintptr_t end, const DWORD protect, const bool firstMatch)
+void MemIn::PatternScanImpl(std::atomic<uintptr_t>& address, const uint8_t* const pattern, const char* const mask, uintptr_t start, const uintptr_t end, const DWORD protect, const bool firstMatch)
 {
 	MEMORY_BASIC_INFORMATION mbi;
 	const size_t patternSize = strlen(mask);
@@ -757,38 +769,32 @@ void MemIn::PatternScanImpl(std::atomic<uintptr_t>& address, std::atomic<size_t>
 	{
 		if (!(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) && (mbi.Protect & protect))
 		{
-			for (; start < reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize; start += 4096)
+			const uint8_t* bytes = reinterpret_cast<const uint8_t*>(start);
+			while(bytes < reinterpret_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize - patternSize)
 			{
-				const uint8_t* bytes = reinterpret_cast<const uint8_t*>(start);
-				for (size_t i = 0; i < 4096 - patternSize; i++)
+				for (size_t j = 0; j < patternSize; j++)
 				{
-					for (size_t j = 0; j < patternSize; j++)
-					{
-						if (!(mask[j] == '?' || bytes[j] == pattern[j]))
-							goto byte_not_match;
-					}
-
-					if (start + i != reinterpret_cast<uintptr_t>(pattern))
-					{
-						uintptr_t addressMatch = start + i; //Found match
-						if (addressMatch < address.load())
-							address = addressMatch;
-						finishCount++; //Increase finish count
-						return;
-					}
-				byte_not_match:
-					bytes++;
+					if (!(mask[j] == '?' || bytes[j] == pattern[j]))
+						goto byte_not_match;
 				}
+
+				if (bytes != pattern)
+				{
+					//Found match
+					if (reinterpret_cast<uintptr_t>(bytes) < address.load())
+						address = reinterpret_cast<uintptr_t>(bytes);
+					return;
+				}
+			byte_not_match:
+				bytes++;
 			}
 		}
 
 		start = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
 	}
-
-	finishCount++;
 }
 
-void MemIn::FindCodeCaveImpl(std::atomic<uintptr_t>& address, std::atomic<size_t>& finishCount, const size_t size, uintptr_t start, const uintptr_t end, const DWORD protect, const bool firstMatch)
+void MemIn::FindCodeCaveImpl(std::atomic<uintptr_t>& address, const size_t size, uintptr_t start, const uintptr_t end, const DWORD protect, const bool firstMatch)
 {
 	MEMORY_BASIC_INFORMATION mbi;
 	size_t count = 0;
@@ -808,7 +814,6 @@ void MemIn::FindCodeCaveImpl(std::atomic<uintptr_t>& address, std::atomic<size_t
 						uintptr_t addressMatch = start - count + 1; //Found match
 						if (addressMatch < address.load())
 							address = addressMatch;
-						finishCount++; //Increase finish count
 						return;
 					}
 				}
@@ -821,6 +826,4 @@ void MemIn::FindCodeCaveImpl(std::atomic<uintptr_t>& address, std::atomic<size_t
 
 		start = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
 	}
-
-	finishCount++;
 }

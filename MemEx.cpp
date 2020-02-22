@@ -1,7 +1,4 @@
 #include "MemEx.h"
-#include <algorithm>
-
-#include <cstdint>
 
 #ifdef UNICODE
 	#define lstrstr wcsstr
@@ -262,7 +259,7 @@ bool MemEx::HashMD5(const uintptr_t address, const size_t size, uint8_t* const o
 
 uintptr_t MemEx::PatternScan(const char* const pattern, const char* const mask, const ScanBoundaries& scanBoundaries, const DWORD protect, const size_t numThreads, const bool firstMatch) const
 {
-	std::atomic<uintptr_t> address = -1; std::atomic<size_t> finishCount = 0;
+	std::atomic<uintptr_t> address = -1;
 
 	uintptr_t start = 0, end = 0;
 	switch (scanBoundaries.scanBoundaries)
@@ -306,7 +303,7 @@ uintptr_t MemEx::PatternScan(const char* const pattern, const char* const mask, 
 	size_t chunkSize = (end - start) / numThreads;
 	std::vector<std::thread> threads;
 	for (size_t i = 0; i < numThreads; i++)
-		threads.emplace_back(std::thread(&MemEx::PatternScanImpl, this, std::ref(address), std::ref(finishCount), reinterpret_cast<const uint8_t* const>(pattern), mask, start + chunkSize * i, start + chunkSize * (i + 1), protect, firstMatch));
+		threads.emplace_back(std::thread(&MemEx::PatternScanImpl, this, std::ref(address), reinterpret_cast<const uint8_t* const>(pattern), mask, start + chunkSize * i, start + chunkSize * (i + 1), protect, firstMatch));
 	
 	for (auto& thread : threads)
 		thread.join();
@@ -314,10 +311,13 @@ uintptr_t MemEx::PatternScan(const char* const pattern, const char* const mask, 
 	return (address.load() != -1) ? address.load() : 0;
 }
 
-uintptr_t MemEx::AOBScan(const char* const AOB, const ScanBoundaries& scanBoundaries, const DWORD protect, const size_t numThreads, const bool firstMatch) const
+uintptr_t MemEx::AOBScan(const char* const AOB, const ScanBoundaries& scanBoundaries, const DWORD protect, size_t* const patternSize, const size_t numThreads, const bool firstMatch) const
 {
 	std::string pattern, mask;
 	AOBToPattern(AOB, pattern, mask);
+
+	if (patternSize)
+		*patternSize = pattern.size();
 
 	return PatternScan(pattern.c_str(), mask.c_str(), scanBoundaries, protect, numThreads, firstMatch);
 }
@@ -571,7 +571,7 @@ uintptr_t MemEx::FindCodeCave(const size_t size, const uint32_t nullByte, const 
 	}
 	else
 	{
-		std::atomic<uintptr_t> atomicAddress = -1; std::atomic<size_t> finishCount = 0;
+		std::atomic<uintptr_t> atomicAddress = -1;
 
 		uintptr_t start = 0, end = 0;
 		switch (scanBoundaries.scanBoundaries)
@@ -617,7 +617,7 @@ uintptr_t MemEx::FindCodeCave(const size_t size, const uint32_t nullByte, const 
 		std::vector<std::thread> threads;
 
 		for (size_t i = 0; i < numThreads; i++)
-			threads.emplace_back(std::thread(&MemEx::FindCodeCaveImpl, this, std::ref(atomicAddress), std::ref(finishCount), size, start + chunkSize * i, start + chunkSize * (static_cast<size_t>(i) + 1), protection, firstMatch));
+			threads.emplace_back(std::thread(&MemEx::FindCodeCaveImpl, this, std::ref(atomicAddress), size, start + chunkSize * i, start + chunkSize * (static_cast<size_t>(i) + 1), protection, firstMatch));
 
 		for (auto& thread : threads)
 			thread.join();
@@ -625,7 +625,7 @@ uintptr_t MemEx::FindCodeCave(const size_t size, const uint32_t nullByte, const 
 		address = (atomicAddress.load() != -1) ? atomicAddress.load() : 0;
 	}
 
-	if (codeCaveSize)
+	if (address && codeCaveSize)
 	{
 		size_t remainingSize = 0; SIZE_T nBytesRead;
 		uint8_t buffer[4096];
@@ -926,9 +926,6 @@ void MemEx::EnumModules(const DWORD processId, bool (*callback)(MODULEENTRY32& m
 //Credits to: https://guidedhacking.com/threads/universal-pattern-signature-parser.9588/ & https://guidedhacking.com/threads/python-script-to-convert-ces-aob-signature-to-c-s-signature-mask.14095/
 void MemEx::AOBToPattern(const char* const AOB, std::string& pattern, std::string& mask)
 {
-	if (!AOB)
-		return;
-
 	auto ishex = [](const char c) -> bool { return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F'); };
 	auto hexchartoint = [](const char c) -> uint8_t { return (c >= 'A') ? (c - 'A' + 10) : (c - '0'); };
 
@@ -939,6 +936,19 @@ void MemEx::AOBToPattern(const char* const AOB, std::string& pattern, std::strin
 			pattern += static_cast<char>((ishex(*(bytes + 1))) ? hexchartoint(*bytes) | (hexchartoint(*(bytes++)) << 4) : hexchartoint(*bytes)), mask += 'x';
 		else if (*bytes == '?')
 			pattern += '\x00', mask += '?', (*(bytes + 1) == '?') ? (bytes++) : (bytes);
+	}
+}
+
+void MemEx::PatternToAOB(const char* const pattern, const char* const mask, std::string& AOB)
+{
+	for (size_t i = 0; mask[i]; i++)
+	{
+		if (mask[i] == '?')
+			AOB += "??";
+		else
+			AOB += static_cast<char>((pattern[i] & 0xF0) >> 4) + static_cast<char>(pattern[i] & 0x0F);
+
+		AOB += ' ';
 	}
 }
 
@@ -969,15 +979,16 @@ bool MemEx::FreeSharedMemory(HANDLE hFileMapping, LPCVOID localView, LPCVOID rem
 bool MemEx::Inject(const TCHAR* const dllPath)
 {
 	LPVOID lpAddress = NULL; HANDLE hThread = NULL;
-	return (lpAddress = VirtualAllocEx(m_hProcess, NULL, 0x1000, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) &&
+	return (lpAddress = VirtualAllocEx(m_hProcess, NULL, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) &&
 		WriteProcessMemory(m_hProcess, lpAddress, dllPath, (static_cast<size_t>(lstrlen(dllPath)) + 1) * sizeof(TCHAR), nullptr) &&
 		(hThread = CreateRemoteThreadEx(m_hProcess, NULL, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(LoadLibrary), lpAddress, NULL, NULL, NULL)) &&
 		WaitForSingleObject(hThread, INFINITE) &&
-		VirtualFreeEx(m_hProcess, lpAddress, 0x1000, MEM_FREE);
+		VirtualFreeEx(m_hProcess, lpAddress, 0x1000, MEM_FREE) &&
+		CloseHandle(hThread);
 }
 
 //Inspired by https://github.com/cheat-engine/cheat-engine/blob/ac072b6fae1e0541d9e54e2b86452507dde4689a/Cheat%20Engine/ceserver/native-api.c
-void MemEx::PatternScanImpl(std::atomic<uintptr_t>& address, std::atomic<size_t>& finishCount, const uint8_t* const pattern, const char* const mask, uintptr_t start, const uintptr_t end, const DWORD protect, const bool firstMatch) const
+void MemEx::PatternScanImpl(std::atomic<uintptr_t>& address, const uint8_t* const pattern, const char* const mask, uintptr_t start, const uintptr_t end, const DWORD protect, const bool firstMatch) const
 {
 	MEMORY_BASIC_INFORMATION mbi;
 	uint8_t buffer[4096];
@@ -1006,7 +1017,6 @@ void MemEx::PatternScanImpl(std::atomic<uintptr_t>& address, std::atomic<size_t>
 						uintptr_t addressMatch = start + i; //Found match
 						if (addressMatch < address.load())
 							address = addressMatch;
-						finishCount++; //Increase finish count
 						return;
 					}
 				byte_not_match:
@@ -1017,11 +1027,9 @@ void MemEx::PatternScanImpl(std::atomic<uintptr_t>& address, std::atomic<size_t>
 
 		start = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
 	}
-
-	finishCount++;
 }
 
-void MemEx::FindCodeCaveImpl(std::atomic<uintptr_t>& address, std::atomic<size_t>& finishCount, const size_t size, uintptr_t start, const uintptr_t end, const DWORD protect, const bool firstMatch) const
+void MemEx::FindCodeCaveImpl(std::atomic<uintptr_t>& address, const size_t size, uintptr_t start, const uintptr_t end, const DWORD protect, const bool firstMatch) const
 {
 	MEMORY_BASIC_INFORMATION mbi;
 	uint8_t buffer[4096];
@@ -1047,7 +1055,6 @@ void MemEx::FindCodeCaveImpl(std::atomic<uintptr_t>& address, std::atomic<size_t
 							uintptr_t addressMatch = start + (b - buffer) - count; //Found match
 							if (addressMatch < address.load())
 								address = addressMatch;
-							finishCount++; //Increase finish count
 							return;
 						}
 					}
@@ -1059,8 +1066,6 @@ void MemEx::FindCodeCaveImpl(std::atomic<uintptr_t>& address, std::atomic<size_t
 
 		start = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
 	}
-
-	finishCount++;
 }
 
 void* MemEx::CallImpl(const CConv cConv, const bool isReturnFloat, const bool isReturnDouble, const size_t returnSize, const uintptr_t functionAddress, std::vector<Arg>& args)
