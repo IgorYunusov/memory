@@ -926,6 +926,9 @@ void MemEx::EnumModules(const DWORD processId, bool (*callback)(MODULEENTRY32& m
 //Credits to: https://guidedhacking.com/threads/universal-pattern-signature-parser.9588/ & https://guidedhacking.com/threads/python-script-to-convert-ces-aob-signature-to-c-s-signature-mask.14095/
 void MemEx::AOBToPattern(const char* const AOB, std::string& pattern, std::string& mask)
 {
+	if (!AOB)
+		return;
+
 	auto ishex = [](const char c) -> bool { return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F'); };
 	auto hexchartoint = [](const char c) -> uint8_t { return (c >= 'A') ? (c - 'A' + 10) : (c - '0'); };
 
@@ -976,15 +979,175 @@ HANDLE MemEx::AllocateSharedMemory(const size_t size, PVOID& localView, PVOID& r
 
 bool MemEx::FreeSharedMemory(HANDLE hFileMapping, LPCVOID localView, LPCVOID remoteView) const { return UnmapLocalViewOfFile(localView) && UnmapRemoteViewOfFile(remoteView) && static_cast<bool>(CloseHandle(hFileMapping)); }
 
-bool MemEx::Inject(const TCHAR* const dllPath)
+struct ManualMappingData
 {
-	LPVOID lpAddress = NULL; HANDLE hThread = NULL;
-	return (lpAddress = VirtualAllocEx(m_hProcess, NULL, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) &&
-		WriteProcessMemory(m_hProcess, lpAddress, dllPath, (static_cast<size_t>(lstrlen(dllPath)) + 1) * sizeof(TCHAR), nullptr) &&
-		(hThread = CreateRemoteThreadEx(m_hProcess, NULL, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(LoadLibrary), lpAddress, NULL, NULL, NULL)) &&
-		WaitForSingleObject(hThread, INFINITE) &&
-		VirtualFreeEx(m_hProcess, lpAddress, 0x1000, MEM_FREE) &&
-		CloseHandle(hThread);
+	uintptr_t moduleBase;
+	HMODULE(__stdcall* loadLibraryA)(LPCSTR);
+	FARPROC(__stdcall* getProcAddress)(HMODULE, LPCSTR);
+	BOOL(__stdcall* virtualFree)(LPVOID, SIZE_T, DWORD);
+	BOOL(__stdcall* virtualProtect)(LPVOID, SIZE_T, DWORD, LPDWORD);
+
+	ManualMappingData(uintptr_t moduleBase)
+		: moduleBase(moduleBase),
+		loadLibraryA(LoadLibraryA),
+		getProcAddress(GetProcAddress),
+		virtualFree(VirtualFree),
+		virtualProtect(VirtualProtect) {}
+};
+
+DWORD __stdcall ManualMappingShellCode(ManualMappingData* manualMappingData)
+{
+	IMAGE_NT_HEADERS* h = reinterpret_cast<IMAGE_NT_HEADERS*>(manualMappingData->moduleBase + reinterpret_cast<IMAGE_DOS_HEADER*>(manualMappingData->moduleBase)->e_lfanew);
+	if (!h)
+		return 0;
+
+	ptrdiff_t deltaBase = static_cast<ptrdiff_t>(manualMappingData->moduleBase) - static_cast<ptrdiff_t>(h->OptionalHeader.ImageBase);
+	if (deltaBase && h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size)
+	{
+		IMAGE_BASE_RELOCATION* r = reinterpret_cast<IMAGE_BASE_RELOCATION*>(manualMappingData->moduleBase + h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
+		while (r->VirtualAddress)
+		{
+			WORD* pRelativeInfo = reinterpret_cast<WORD*>(r + 1);
+			for (UINT i = 0; i < ((r->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD)); ++i, ++pRelativeInfo)
+			{
+#ifdef _WIN64
+				if((*pRelativeInfo >> 0x0C) == IMAGE_REL_BASED_DIR64)
+#else
+				if((*pRelativeInfo >> 0x0C) == IMAGE_REL_BASED_HIGHLOW)
+#endif
+				{
+					ULONG_PTR* pPatch = reinterpret_cast<ULONG_PTR*>(manualMappingData->moduleBase + r->VirtualAddress + ((*pRelativeInfo) & 0xFFF));
+					*pPatch += deltaBase;
+				}
+			}
+			r = reinterpret_cast<IMAGE_BASE_RELOCATION*>(reinterpret_cast<uintptr_t>(r) + r->SizeOfBlock);
+		}
+	}
+	
+	if (h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size)
+	{
+		for(IMAGE_IMPORT_DESCRIPTOR* d = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(manualMappingData->moduleBase + h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress); d->Name; d++)
+		{
+			char* moduleName = reinterpret_cast<char*>(manualMappingData->moduleBase + d->Name);
+			HMODULE hModule = manualMappingData->loadLibraryA(moduleName);
+			if (!hModule)
+				continue;
+
+			ULONG_PTR* pThunkRef = reinterpret_cast<ULONG_PTR*>(manualMappingData->moduleBase + d->OriginalFirstThunk);
+			ULONG_PTR* pFuncRef = reinterpret_cast<ULONG_PTR*>(manualMappingData->moduleBase + d->FirstThunk);
+
+			if (!d->OriginalFirstThunk)
+				pThunkRef = pFuncRef;
+
+			for (; *pThunkRef; pThunkRef++, pFuncRef++)
+			{
+				if (IMAGE_SNAP_BY_ORDINAL(*pThunkRef))
+					*pFuncRef = reinterpret_cast<ULONG_PTR>(manualMappingData->getProcAddress(hModule, reinterpret_cast<char*>(*pThunkRef & 0xFFFF)));
+				else
+				{
+					IMAGE_IMPORT_BY_NAME* pImport = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(manualMappingData->moduleBase + (*pThunkRef));
+					*pFuncRef = reinterpret_cast<ULONG_PTR>(manualMappingData->getProcAddress(hModule, pImport->Name));
+				}
+			}
+		}
+	}
+	
+	if (h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size)
+	{
+		IMAGE_TLS_DIRECTORY* pTLS = reinterpret_cast<IMAGE_TLS_DIRECTORY*>(manualMappingData->moduleBase + h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
+		for (PIMAGE_TLS_CALLBACK* pCallback = reinterpret_cast<PIMAGE_TLS_CALLBACK*>(pTLS->AddressOfCallBacks); *pCallback; pCallback++)
+			(*pCallback)(reinterpret_cast<PVOID>(manualMappingData->moduleBase), DLL_PROCESS_ATTACH, nullptr);
+	}
+		
+	reinterpret_cast<bool(__stdcall*)(HMODULE, DWORD, LPVOID)>(manualMappingData->moduleBase + h->OptionalHeader.AddressOfEntryPoint)(reinterpret_cast<HMODULE>(manualMappingData->moduleBase), DLL_PROCESS_ATTACH, NULL);
+	
+	return 0;
+}
+
+bool ManualMappingShellCodeEnd() { return true; }
+
+bool MemEx::Inject(const InjectionInfo& injectionInfo)
+{
+	HANDLE hThread;
+
+	if (injectionInfo.injectionMethod == INJECTION_METHOD::MANUAL_MAPPING)
+	{
+		DWORD numBytesRead;
+		std::unique_ptr<char[]> rawImageUniquePtr;
+		const char* rawImage = nullptr;
+
+		//Load image from disk if the user specified a path.
+		if (injectionInfo.isPath)
+		{
+			HANDLE hFile;
+			DWORD fileSize;
+			if ((hFile = CreateFile(reinterpret_cast<const TCHAR*>(injectionInfo.dll), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, NULL, NULL)) == INVALID_HANDLE_VALUE ||
+				!(fileSize = GetCompressedFileSize(reinterpret_cast<const TCHAR*>(injectionInfo.dll), NULL)) ||
+				fileSize < 0x400 ||
+				!(rawImageUniquePtr = std::make_unique<char[]>(static_cast<size_t>(fileSize))) ||
+				!ReadFile(hFile, rawImageUniquePtr.get(), fileSize, &numBytesRead, NULL) ||
+				!CloseHandle(hFile) ||
+				!(rawImage = rawImageUniquePtr.get()))
+				return false;
+		}
+		else if(!(rawImage = reinterpret_cast<const char*>(injectionInfo.dll)))
+			return false;
+
+		//Do some checks to validate the image.
+		const IMAGE_DOS_HEADER* idh = reinterpret_cast<const IMAGE_DOS_HEADER*>(rawImage);
+		if (!idh || (injectionInfo.isPath ? static_cast<DWORD>(idh->e_lfanew) > numBytesRead : false) || idh->e_magic != 0x5A4D)
+			return false;
+
+		const IMAGE_NT_HEADERS* inth = reinterpret_cast<const IMAGE_NT_HEADERS*>(rawImage + idh->e_lfanew);
+		if (inth->Signature != 0x00004550 || inth->FileHeader.NumberOfSections > 96 || inth->FileHeader.SizeOfOptionalHeader == 0 || !(inth->FileHeader.Characteristics & (IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_DLL)))
+			return false;
+
+#ifdef _WIN64
+		if (inth->OptionalHeader.Magic != 0x20b)
+			return false;
+#else
+		if (inth->OptionalHeader.Magic != 0x10b)
+			return false;
+#endif
+		
+		//Try to allocate a buffer for the image.
+		LPVOID moduleBase = VirtualAllocEx(m_hProcess, NULL, inth->OptionalHeader.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+		if (!moduleBase)
+			return false;
+		
+		//Copy headers
+		WriteProcessMemory(m_hProcess, moduleBase, rawImage, 0x1000, NULL);
+
+		//Copy sections
+		const IMAGE_SECTION_HEADER* ish = IMAGE_FIRST_SECTION(inth);
+		for (WORD i = 0; i < inth->FileHeader.NumberOfSections; i++, ish++)
+		{
+			if (ish->PointerToRawData)
+				WriteProcessMemory(m_hProcess, reinterpret_cast<LPVOID>(reinterpret_cast<uintptr_t>(moduleBase) + ish->VirtualAddress), rawImage + ish->PointerToRawData, ish->SizeOfRawData, NULL);
+		}
+
+		ManualMappingData manualMappingData(reinterpret_cast<uintptr_t>(moduleBase));
+		SIZE_T manualMappingShellCodeSize = static_cast<SIZE_T>(reinterpret_cast<ptrdiff_t>(ManualMappingShellCodeEnd) - reinterpret_cast<ptrdiff_t>(ManualMappingShellCode));
+		LPVOID manualMappingShellCodeAddress;
+
+		return (manualMappingShellCodeAddress = VirtualAllocEx(m_hProcess, NULL, manualMappingShellCodeSize + sizeof(ManualMappingData), MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) &&
+			WriteProcessMemory(m_hProcess, manualMappingShellCodeAddress, ManualMappingShellCode, manualMappingShellCodeSize, NULL) &&
+			WriteProcessMemory(m_hProcess, reinterpret_cast<LPVOID>(reinterpret_cast<uintptr_t>(manualMappingShellCodeAddress) + manualMappingShellCodeSize), &manualMappingData, sizeof(ManualMappingData), NULL) &&
+			(hThread = CreateRemoteThread(m_hProcess, NULL, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(manualMappingShellCodeAddress), reinterpret_cast<LPVOID>(reinterpret_cast<uintptr_t>(manualMappingShellCodeAddress) + manualMappingShellCodeSize), NULL, NULL)) &&
+			WaitForSingleObject(hThread, INFINITE) &&
+			VirtualFreeEx(m_hProcess, manualMappingShellCodeAddress, 0, MEM_RELEASE) &&
+			CloseHandle(hThread);
+	}
+	else
+	{
+		LPVOID lpAddress = NULL;
+		return (lpAddress = VirtualAllocEx(m_hProcess, NULL, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) &&
+			WriteProcessMemory(m_hProcess, lpAddress, injectionInfo.dll, (static_cast<size_t>(lstrlen(reinterpret_cast<const TCHAR*>(injectionInfo.dll))) + 1) * sizeof(TCHAR), nullptr) &&
+			(hThread = CreateRemoteThread(m_hProcess, NULL, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(LoadLibrary), lpAddress, NULL, NULL)) &&
+			WaitForSingleObject(hThread, INFINITE) &&
+			VirtualFreeEx(m_hProcess, lpAddress, 0x1000, MEM_FREE) &&
+			CloseHandle(hThread);
+	}
 }
 
 //Inspired by https://github.com/cheat-engine/cheat-engine/blob/ac072b6fae1e0541d9e54e2b86452507dde4689a/Cheat%20Engine/ceserver/native-api.c

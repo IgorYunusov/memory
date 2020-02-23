@@ -733,6 +733,9 @@ void MemIn::EnumModules(const DWORD processId, bool (*callback)(MODULEENTRY32& m
 //Credits to: https://guidedhacking.com/threads/universal-pattern-signature-parser.9588/ & https://guidedhacking.com/threads/python-script-to-convert-ces-aob-signature-to-c-s-signature-mask.14095/
 void MemIn::AOBToPattern(const char* const AOB, std::string& pattern, std::string& mask)
 {
+	if (!AOB)
+		return;
+
 	auto ishex = [](const char c) -> bool { return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F'); };
 	auto hexchartoint = [](const char c) -> uint8_t { return (c >= 'A') ? (c - 'A' + 10) : (c - '0'); };
 

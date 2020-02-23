@@ -158,6 +158,34 @@ struct ThreadData
 	std::vector<Value<T>> values;
 };
 
+enum class INJECTION_METHOD
+{
+	LOAD_LIBRARY,
+	MANUAL_MAPPING
+};
+
+struct InjectionInfo
+{
+	bool isPath;
+	INJECTION_METHOD injectionMethod;
+	const void* dll;
+
+	//Parameters:
+	//  dll  [in] A pointer to the dll file in memory.
+	explicit InjectionInfo(const void* dll)
+		: isPath(false),
+		injectionMethod(INJECTION_METHOD::MANUAL_MAPPING),
+		dll(dll) {}
+
+	//Parameters:
+	//  dllPath         [in] The path to the dll.
+	//  injectionMethod [in] The injection method.
+	explicit InjectionInfo(const TCHAR* dllPath, INJECTION_METHOD injectionMethod = INJECTION_METHOD::LOAD_LIBRARY)
+		: isPath(true),
+		injectionMethod(injectionMethod),
+		dll(dllPath) {}
+};
+
 typedef struct ArgPtr
 {
 	const void* const data;
@@ -739,7 +767,10 @@ public:
 	//  size [in] The size of the file-mapping object.
 	static HANDLE CreateSharedMemory(const size_t size);
 
-	bool Inject(const TCHAR* const dllPath);
+	//Injects a dll into the attached process.
+	//Parameters:
+	//  injectionInfo [in] See the class definition.
+	bool Inject(const InjectionInfo& injectionInfo);
 
 private:
 	void PatternScanImpl(std::atomic<uintptr_t>& address, const uint8_t* const pattern, const char* const mask, uintptr_t start, const uintptr_t end, const DWORD protect, const bool firstMatch) const;
