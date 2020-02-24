@@ -1031,11 +1031,11 @@ struct ManualMappingData
 		virtualProtect(VirtualProtect) {}
 };
 
-DWORD __stdcall ManualMappingShellCode(ManualMappingData* manualMappingData)
+bool __stdcall ManualMappingShellCode(ManualMappingData* manualMappingData)
 {
 	IMAGE_NT_HEADERS* h = reinterpret_cast<IMAGE_NT_HEADERS*>(manualMappingData->moduleBase + reinterpret_cast<IMAGE_DOS_HEADER*>(manualMappingData->moduleBase)->e_lfanew);
 	if (!h)
-		return 0;
+		return false;
 
 	ptrdiff_t deltaBase = static_cast<ptrdiff_t>(manualMappingData->moduleBase) - static_cast<ptrdiff_t>(h->OptionalHeader.ImageBase);
 	if (deltaBase && h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size)
@@ -1067,7 +1067,7 @@ DWORD __stdcall ManualMappingShellCode(ManualMappingData* manualMappingData)
 			char* moduleName = reinterpret_cast<char*>(manualMappingData->moduleBase + d->Name);
 			HMODULE hModule = manualMappingData->loadLibraryA(moduleName);
 			if (!hModule)
-				continue;
+				return false;
 
 			ULONG_PTR* pThunkRef = reinterpret_cast<ULONG_PTR*>(manualMappingData->moduleBase + d->OriginalFirstThunk);
 			ULONG_PTR* pFuncRef = reinterpret_cast<ULONG_PTR*>(manualMappingData->moduleBase + d->FirstThunk);
@@ -1095,9 +1095,7 @@ DWORD __stdcall ManualMappingShellCode(ManualMappingData* manualMappingData)
 			(*pCallback)(reinterpret_cast<PVOID>(manualMappingData->moduleBase), DLL_PROCESS_ATTACH, nullptr);
 	}
 		
-	reinterpret_cast<bool(__stdcall*)(HMODULE, DWORD, LPVOID)>(manualMappingData->moduleBase + h->OptionalHeader.AddressOfEntryPoint)(reinterpret_cast<HMODULE>(manualMappingData->moduleBase), DLL_PROCESS_ATTACH, NULL);
-	
-	return 0;
+	return reinterpret_cast<bool(__stdcall*)(HMODULE, DWORD, LPVOID)>(manualMappingData->moduleBase + h->OptionalHeader.AddressOfEntryPoint)(reinterpret_cast<HMODULE>(manualMappingData->moduleBase), DLL_PROCESS_ATTACH, NULL);
 }
 
 bool ManualMappingShellCodeEnd() { return true; }
@@ -1105,6 +1103,7 @@ bool ManualMappingShellCodeEnd() { return true; }
 bool MemEx::Inject(const InjectionInfo& injectionInfo)
 {
 	HANDLE hThread;
+	DWORD exitCode;
 
 	if (injectionInfo.injectionMethod == INJECTION_METHOD::MANUAL_MAPPING)
 	{
@@ -1170,8 +1169,10 @@ bool MemEx::Inject(const InjectionInfo& injectionInfo)
 			WriteProcessMemory(m_hProcess, manualMappingShellCodeAddress, ManualMappingShellCode, manualMappingShellCodeSize, NULL) &&
 			WriteProcessMemory(m_hProcess, reinterpret_cast<LPVOID>(reinterpret_cast<uintptr_t>(manualMappingShellCodeAddress) + manualMappingShellCodeSize), &manualMappingData, sizeof(ManualMappingData), NULL) &&
 			(hThread = CreateRemoteThread(m_hProcess, NULL, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(manualMappingShellCodeAddress), reinterpret_cast<LPVOID>(reinterpret_cast<uintptr_t>(manualMappingShellCodeAddress) + manualMappingShellCodeSize), NULL, NULL)) &&
-			WaitForSingleObject(hThread, INFINITE) &&
+			WaitForSingleObject(hThread, INFINITE) != WAIT_FAILED &&
 			VirtualFreeEx(m_hProcess, manualMappingShellCodeAddress, 0, MEM_RELEASE) &&
+			GetExitCodeThread(hThread, &exitCode) &&
+			exitCode &&
 			CloseHandle(hThread);
 	}
 	else
@@ -1180,8 +1181,10 @@ bool MemEx::Inject(const InjectionInfo& injectionInfo)
 		return (lpAddress = VirtualAllocEx(m_hProcess, NULL, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) &&
 			WriteProcessMemory(m_hProcess, lpAddress, injectionInfo.dll, (static_cast<size_t>(lstrlen(reinterpret_cast<const TCHAR*>(injectionInfo.dll))) + 1) * sizeof(TCHAR), nullptr) &&
 			(hThread = CreateRemoteThread(m_hProcess, NULL, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(LoadLibrary), lpAddress, NULL, NULL)) &&
-			WaitForSingleObject(hThread, INFINITE) &&
-			VirtualFreeEx(m_hProcess, lpAddress, 0x1000, MEM_FREE) &&
+			WaitForSingleObject(hThread, INFINITE) != WAIT_FAILED &&
+			VirtualFreeEx(m_hProcess, lpAddress, 0, MEM_RELEASE) &&
+			GetExitCodeThread(hThread, &exitCode) &&
+			exitCode &&
 			CloseHandle(hThread);
 	}
 }

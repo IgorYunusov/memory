@@ -767,7 +767,8 @@ public:
 	//  size [in] The size of the file-mapping object.
 	static HANDLE CreateSharedMemory(const size_t size);
 
-	//Injects a dll into the attached process.
+	//Injects a dll into the attached process. If you choose to use
+	//manual mapping, it's recommended to compile in release mode.
 	//Parameters:
 	//  injectionInfo [in] See the class definition.
 	bool Inject(const InjectionInfo& injectionInfo);
