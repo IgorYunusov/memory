@@ -2,8 +2,10 @@
 
 #ifdef UNICODE
 	#define lstrstr wcsstr
+	#define lstring wstring
 #else
 	#define lstrstr strstr
+	#define lstring string
 #endif
 
 #define PLACE(type, value) *reinterpret_cast<type*>(buffer) = (type)(value); buffer += sizeof(type)
@@ -774,13 +776,27 @@ DWORD MemEx::GetProcessIdByName(const TCHAR* processName)
 	if (hSnapshot == INVALID_HANDLE_VALUE)
 		return 0;
 
+	std::lstring processNameLowercase(processName);
+	std::transform(processNameLowercase.begin(), processNameLowercase.end(), processNameLowercase.begin(), [](TCHAR c) { return c >= 'A' && c < 'Z' ? c + 0x20 : c; });
+
 	PROCESSENTRY32 pe32;
 	pe32.dwSize = sizeof(PROCESSENTRY32);
 	if (Process32First(hSnapshot, &pe32))
 	{
 		do
 		{
-			if (!lstrcmp(processName, pe32.szExeFile))
+			bool match = true;
+			for (int i = 0; pe32.szExeFile[i]; i++)
+			{
+				TCHAR c = pe32.szExeFile[i];
+				if ((c >= 'A' && c <= 'Z' ? c + 0x20 : c) != processNameLowercase[i])
+				{
+					match = false;
+					break;
+				}
+			}
+
+			if (match)
 			{
 				CloseHandle(hSnapshot);
 				return pe32.th32ProcessID;
@@ -805,20 +821,40 @@ uintptr_t MemEx::GetModuleBase(const TCHAR* const moduleName, DWORD* const pModu
 
 uintptr_t MemEx::GetModuleBase(const DWORD dwProcessId, const TCHAR* const moduleName, DWORD* const pModuleSize)
 {
-	struct ModuleInfo { const TCHAR* const name; uintptr_t base; DWORD* const size; };
-	ModuleInfo mi = { moduleName, NULL, pModuleSize};
+	struct ModuleInfo { std::lstring* name; uintptr_t base; DWORD* const size; };
+
+	std::lstring moduleNameLowerCase;
+	ModuleInfo mi = { nullptr, NULL, pModuleSize};
+
+	if (moduleName)
+	{
+		moduleNameLowerCase = moduleName;
+		std::transform(moduleNameLowerCase.begin(), moduleNameLowerCase.end(), moduleNameLowerCase.begin(), [](TCHAR c) { return c >= 'A' && c < 'Z' ? c + 0x20 : c; });
+		mi.name = &moduleNameLowerCase;
+	}
 
 	EnumModules(dwProcessId,
 		[](MODULEENTRY32& me, void* param)
 		{
 			ModuleInfo* mi = static_cast<ModuleInfo*>(param);
-			std::transform(std::begin(me.szModule), std::end(me.szModule), me.szModule, tolower);
-
-			TCHAR moduleNameLowerCase[MAX_MODULE_NAME32 + 1] = { TEXT('\0') };
-			if(mi->name)
-				std::transform(mi->name, mi->name + lstrlen(mi->name) + 1, moduleNameLowerCase, tolower);
 			
-			if ((mi->name) ? (!lstrcmp(me.szModule, moduleNameLowerCase)) : (lstrstr(me.szModule, TEXT(".exe")) != nullptr))
+			bool match = true;
+			if (mi->name)
+			{
+				for (int i = 0; me.szModule[i]; i++)
+				{
+					TCHAR c = me.szModule[i];
+					if ((c >= 'A' && c <= 'Z' ? c + 0x20 : c) != mi->name->at(i))
+					{
+						match = false;
+						break;
+					}
+				}
+			}
+			else
+				match = lstrstr(me.szModule, TEXT(".exe")) != nullptr;
+
+			if (match)
 			{
 				mi->base = reinterpret_cast<uintptr_t>(me.modBaseAddr);
 				if(mi->size)
