@@ -164,28 +164,6 @@ enum class INJECTION_METHOD
 	MANUAL_MAPPING
 };
 
-struct InjectionInfo
-{
-	bool isPath;
-	INJECTION_METHOD injectionMethod;
-	const void* dll;
-
-	//Parameters:
-	//  dll  [in] A pointer to the dll file in memory.
-	explicit InjectionInfo(const void* dll)
-		: isPath(false),
-		injectionMethod(INJECTION_METHOD::MANUAL_MAPPING),
-		dll(dll) {}
-
-	//Parameters:
-	//  dllPath         [in] The path to the dll.
-	//  injectionMethod [in] The injection method.
-	explicit InjectionInfo(const TCHAR* dllPath, INJECTION_METHOD injectionMethod = INJECTION_METHOD::LOAD_LIBRARY)
-		: isPath(true),
-		injectionMethod(injectionMethod),
-		dll(dllPath) {}
-};
-
 typedef struct ArgPtr
 {
 	const void* const data;
@@ -769,9 +747,14 @@ public:
 
 	//Injects a dll into the attached process. If you choose to use
 	//manual mapping, it's recommended to compile in release mode.
+	//The function fails if 'injectionMethod' is LOAD_LIBRARY and
+	//'isPath' is false.
 	//Parameters:
-	//  injectionInfo [in] See the class definition.
-	bool Inject(const InjectionInfo& injectionInfo);
+	//  dll             [in] See the 'isPath' parameter.
+	//  injectionMethod [in] The injection method.
+	//  isPath          [in] If true, 'dll' specifies the path to the dll,
+	//otherwise 'dll' is a pointer to the dll in memory.
+	bool Inject(const void* dll, INJECTION_METHOD injectionMethod = INJECTION_METHOD::LOAD_LIBRARY, bool isPath = true);
 
 private:
 	void PatternScanImpl(std::atomic<uintptr_t>& address, const uint8_t* const pattern, const char* const mask, uintptr_t start, const uintptr_t end, const DWORD protect, const bool firstMatch) const;

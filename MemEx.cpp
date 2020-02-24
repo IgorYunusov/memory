@@ -1100,24 +1100,24 @@ bool __stdcall ManualMappingShellCode(ManualMappingData* manualMappingData)
 
 bool ManualMappingShellCodeEnd() { return true; }
 
-bool MemEx::Inject(const InjectionInfo& injectionInfo)
+bool MemEx::Inject(const void* dll, INJECTION_METHOD injectionMethod, bool isPath)
 {
 	HANDLE hThread;
 	DWORD exitCode;
 
-	if (injectionInfo.injectionMethod == INJECTION_METHOD::MANUAL_MAPPING)
+	if (injectionMethod == INJECTION_METHOD::MANUAL_MAPPING)
 	{
 		DWORD numBytesRead;
 		std::unique_ptr<char[]> rawImageUniquePtr;
 		const char* rawImage = nullptr;
 
 		//Load image from disk if the user specified a path.
-		if (injectionInfo.isPath)
+		if (isPath)
 		{
 			HANDLE hFile;
 			DWORD fileSize;
-			if ((hFile = CreateFile(reinterpret_cast<const TCHAR*>(injectionInfo.dll), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, NULL, NULL)) == INVALID_HANDLE_VALUE ||
-				!(fileSize = GetCompressedFileSize(reinterpret_cast<const TCHAR*>(injectionInfo.dll), NULL)) ||
+			if ((hFile = CreateFile(reinterpret_cast<const TCHAR*>(dll), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, NULL, NULL)) == INVALID_HANDLE_VALUE ||
+				!(fileSize = GetCompressedFileSize(reinterpret_cast<const TCHAR*>(dll), NULL)) ||
 				fileSize < 0x400 ||
 				!(rawImageUniquePtr = std::make_unique<char[]>(static_cast<size_t>(fileSize))) ||
 				!ReadFile(hFile, rawImageUniquePtr.get(), fileSize, &numBytesRead, NULL) ||
@@ -1125,12 +1125,12 @@ bool MemEx::Inject(const InjectionInfo& injectionInfo)
 				!(rawImage = rawImageUniquePtr.get()))
 				return false;
 		}
-		else if(!(rawImage = reinterpret_cast<const char*>(injectionInfo.dll)))
+		else if(!(rawImage = reinterpret_cast<const char*>(dll)))
 			return false;
 
 		//Do some checks to validate the image.
 		const IMAGE_DOS_HEADER* idh = reinterpret_cast<const IMAGE_DOS_HEADER*>(rawImage);
-		if (!idh || (injectionInfo.isPath ? static_cast<DWORD>(idh->e_lfanew) > numBytesRead : false) || idh->e_magic != 0x5A4D)
+		if (!idh || (isPath ? static_cast<DWORD>(idh->e_lfanew) > numBytesRead : false) || idh->e_magic != 0x5A4D)
 			return false;
 
 		const IMAGE_NT_HEADERS* inth = reinterpret_cast<const IMAGE_NT_HEADERS*>(rawImage + idh->e_lfanew);
@@ -1178,8 +1178,9 @@ bool MemEx::Inject(const InjectionInfo& injectionInfo)
 	else
 	{
 		LPVOID lpAddress = NULL;
-		return (lpAddress = VirtualAllocEx(m_hProcess, NULL, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) &&
-			WriteProcessMemory(m_hProcess, lpAddress, injectionInfo.dll, (static_cast<size_t>(lstrlen(reinterpret_cast<const TCHAR*>(injectionInfo.dll))) + 1) * sizeof(TCHAR), nullptr) &&
+		return isPath &&
+			(lpAddress = VirtualAllocEx(m_hProcess, NULL, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) &&
+			WriteProcessMemory(m_hProcess, lpAddress, dll, (static_cast<size_t>(lstrlen(reinterpret_cast<const TCHAR*>(dll))) + 1) * sizeof(TCHAR), nullptr) &&
 			(hThread = CreateRemoteThread(m_hProcess, NULL, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(LoadLibrary), lpAddress, NULL, NULL)) &&
 			WaitForSingleObject(hThread, INFINITE) != WAIT_FAILED &&
 			VirtualFreeEx(m_hProcess, lpAddress, 0, MEM_RELEASE) &&
