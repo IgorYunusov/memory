@@ -244,8 +244,11 @@ class MemEx
 	std::map<uintptr_t, HookStruct> m_Hooks;
 
 	std::unordered_map<uintptr_t, size_t> m_Pages;
+
+	bool m_isWow64;
 public:
 	const static DWORD dwPageSize;
+	const static DWORD dwDesiredAccess;
 
 	MemEx();
 	~MemEx();
@@ -263,38 +266,43 @@ public:
 
 	//Opens to a process using a PID.
 	//Parameters:
-	//  dwProcessId [in] The process's id.
-	bool Open(const DWORD dwProcessId);
+	//  dwProcessId     [in] The process's id.
+	//  dwDesiredAccess [in] The access for the process handle.
+	bool Open(const DWORD dwProcessId, const DWORD dwDesiredAccess = MemEx::dwDesiredAccess);
 
 	//Opens to a process using its name.
 	//Parameters:
-	//  processName [in] The process's name.
-	bool Open(const TCHAR* const processName);
+	//  processName     [in] The process's name.
+	//  dwDesiredAccess [in] The access for the process handle.
+	bool Open(const TCHAR* const processName, const DWORD dwDesiredAccess = MemEx::dwDesiredAccess);
 
 	//Opens to a process using a window and class name.
 	//Parameters:
-	//  windowName [in] The window's title. If NULL, all window 
-	//                  names match.
-	//  className  [in] The class name. If NULL, any window title
-	//                  matching windowName is considered.
-	bool OpenByWindow(const TCHAR* const windowName, const TCHAR* const className = nullptr);
+	//  windowName      [in] The window's title. If NULL, all window 
+	//                       names match.
+	//  className       [in] The class name. If NULL, any window title
+	//                       matching windowName is considered.
+	//  dwDesiredAccess [in] The access for the process handle.
+	bool OpenByWindow(const TCHAR* const windowName, const TCHAR* const className = nullptr, const DWORD dwDesiredAccess = MemEx::dwDesiredAccess);
 	
 	//Opens to a process using its name. The functions does not return until a process that matches processName is found.
 	//Parameters:
-	//  processName    [in] The process's name.
-	//  dwMilliseconds [in] The number of milliseconds the
-	//                      thread sleeps every iteration.
-	void WaitOpen(const TCHAR* const processName, const DWORD dwMilliseconds = 500);
+	//  processName     [in] The process's name.
+	//  dwDesiredAccess [in] The access for the process handle.
+	//  dwMilliseconds  [in] The number of milliseconds the
+	//                       thread sleeps every iteration.
+	void WaitOpen(const TCHAR* const processName, const DWORD dwDesiredAccess = MemEx::dwDesiredAccess, const DWORD dwMilliseconds = 500);
 
 	//Opens to a process using a window and class name. The functions does not return until a process that matches processName is found.
 	//Parameters:
-	//  windowName     [in] The window's title. If NULL, all window 
-	//                      names match.
-	//  className      [in] The class name. If NULL, any window title
-	//                      matching windowName is considered.
-	//  dwMilliseconds [in] The number of milliseconds the thread 
-	//                      sleeps every iteration.
-	void WaitOpenByWindow(const TCHAR* const windowName, const TCHAR* const className = nullptr, const DWORD dwMilliseconds = 500);
+	//  windowName      [in] The window's title. If NULL, all window 
+	//                       names match.
+	//  className       [in] The class name. If NULL, any window title
+	//                       matching windowName is considered.
+	//  dwDesiredAccess [in] The access for the process handle.
+	//  dwMilliseconds  [in] The number of milliseconds the thread 
+	//                       sleeps every iteration.
+	void WaitOpenByWindow(const TCHAR* const windowName, const TCHAR* const className = nullptr, const DWORD dwDesiredAccess = MemEx::dwDesiredAccess, const DWORD dwMilliseconds = 500);
 
 	//Terminates any remote threads and memory allocations created by this library on the process. 
 	void Close();
@@ -745,7 +753,7 @@ public:
 	//  size [in] The size of the file-mapping object.
 	static HANDLE CreateSharedMemory(const size_t size);
 
-	//Injects a dll into the attached process. If you choose to use
+	//Injects a dll into the opened process. If you choose to use
 	//manual mapping, it's recommended to compile in release mode.
 	//The function fails if 'injectionMethod' is LOAD_LIBRARY and
 	//'isPath' is false.
@@ -755,6 +763,12 @@ public:
 	//  isPath          [in] If true, 'dll' specifies the path to the dll,
 	//otherwise 'dll' is a pointer to the dll in memory.
 	bool Inject(const void* dll, INJECTION_METHOD injectionMethod = INJECTION_METHOD::LOAD_LIBRARY, bool isPath = true);
+
+	//Retrieves the address of a function from the opened process.
+	//  moduleBase    [in]  The module's base on the opened process.
+	//  procedureName [in]  The procedure's name on the opened process.
+	//  pOrdinal      [out] A pointer to a variable that receives the procedure's ordinal.
+	uintptr_t GetProcAddressEx(uintptr_t moduleBase, const char* procedureName, uint16_t* const pOrdinal = nullptr);
 
 private:
 	void PatternScanImpl(std::atomic<uintptr_t>& address, const uint8_t* const pattern, const char* const mask, uintptr_t start, const uintptr_t end, const DWORD protect, const bool firstMatch) const;

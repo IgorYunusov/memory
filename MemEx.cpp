@@ -76,6 +76,7 @@ typedef PVOID (__stdcall * _MapViewOfFileNuma2)(HANDLE FileMappingHandle, HANDLE
 typedef BOOL (__stdcall * _UnmapViewOfFile2)(HANDLE Process, LPCVOID BaseAddress, ULONG UnmapFlags);
 
 const DWORD MemEx::dwPageSize = MemEx::GetPageSize();
+const DWORD MemEx::dwDesiredAccess = PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_DUP_HANDLE | PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION;
 
 MemEx::MemEx()
 	: m_hProcess(NULL),
@@ -85,7 +86,8 @@ MemEx::MemEx()
 	m_hEvent1(NULL), m_hEvent2(NULL),
 	m_hEventDuplicate1(NULL), m_hEventDuplicate2(NULL),
 	m_targetMappedView(NULL), m_thisMappedView(NULL),
-	m_numPages(0) {}
+	m_numPages(0),
+	m_isWow64(false) {}
 
 MemEx::~MemEx() { Close(); }
 
@@ -94,27 +96,24 @@ bool MemEx::IsOpened() { return m_hProcess; }
 bool MemEx::Open(const HANDLE hProcess)
 {
 	DWORD tmp;
-	if (m_hProcess || !GetHandleInformation((m_hProcess = hProcess), &tmp))
-		return false;
-
-	m_dwProcessId = GetProcessId(hProcess);
-
 	m_numPages = 1;
-
-	return true;
+	return !m_hProcess &&
+		GetHandleInformation((m_hProcess = hProcess), &tmp) &&
+		(m_dwProcessId = GetProcessId(hProcess)) &&
+		IsWow64Process(m_hProcess, reinterpret_cast<PBOOL>(&m_isWow64));
 }
-bool MemEx::Open(const DWORD dwProcessId) { return Open(OpenProcess(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_DUP_HANDLE | PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION, FALSE, dwProcessId)); }
-bool MemEx::Open(const TCHAR* const processName) { return Open(MemEx::GetProcessIdByName(processName)); }
-bool MemEx::OpenByWindow(const TCHAR* const windowName, const TCHAR* const className) { return Open(MemEx::GetProcessIdByWindow(windowName, className)); }
+bool MemEx::Open(const DWORD dwProcessId, const DWORD dwDesiredAccess) { return Open(OpenProcess(dwDesiredAccess, FALSE, dwProcessId)); }
+bool MemEx::Open(const TCHAR* const processName, const DWORD dwDesiredAccess) { return Open(MemEx::GetProcessIdByName(processName), dwDesiredAccess); }
+bool MemEx::OpenByWindow(const TCHAR* const windowName, const TCHAR* const className, const DWORD dwDesiredAccess) { return Open(MemEx::GetProcessIdByWindow(windowName, className), dwDesiredAccess); }
 
-void MemEx::WaitOpen(const TCHAR* const processName, const DWORD dwMilliseconds)
+void MemEx::WaitOpen(const TCHAR* const processName, const DWORD dwDesiredAccess, const DWORD dwMilliseconds)
 {
-	while (!Open(processName))
+	while (!Open(processName, dwDesiredAccess))
 		Sleep(dwMilliseconds);
 }
-void MemEx::WaitOpenByWindow(const TCHAR* const windowName, const TCHAR* const className, const DWORD dwMilliseconds)
+void MemEx::WaitOpenByWindow(const TCHAR* const windowName, const TCHAR* const className, const DWORD dwDesiredAccess, const DWORD dwMilliseconds)
 {
-	while (!OpenByWindow(windowName, className))
+	while (!OpenByWindow(windowName, className, dwDesiredAccess))
 		Sleep(dwMilliseconds);
 }
 
@@ -1178,16 +1177,92 @@ bool MemEx::Inject(const void* dll, INJECTION_METHOD injectionMethod, bool isPat
 	else
 	{
 		LPVOID lpAddress = NULL;
+
+		LPVOID loadLibrary = LoadLibrary;
+		if (m_isWow64)
+		{
+			loadLibrary = reinterpret_cast<LPVOID>(GetProcAddressEx(GetModuleBase("kernel32.dll"),
+#ifdef UNICODE
+				"LoadLibraryW"
+#else
+				"LoadLibraryA"
+#endif
+			));
+		}
+		
 		return isPath &&
 			(lpAddress = VirtualAllocEx(m_hProcess, NULL, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) &&
 			WriteProcessMemory(m_hProcess, lpAddress, dll, (static_cast<size_t>(lstrlen(reinterpret_cast<const TCHAR*>(dll))) + 1) * sizeof(TCHAR), nullptr) &&
-			(hThread = CreateRemoteThread(m_hProcess, NULL, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(LoadLibrary), lpAddress, NULL, NULL)) &&
+			(hThread = CreateRemoteThread(m_hProcess, NULL, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(loadLibrary), lpAddress, NULL, NULL)) &&
 			WaitForSingleObject(hThread, INFINITE) != WAIT_FAILED &&
 			VirtualFreeEx(m_hProcess, lpAddress, 0, MEM_RELEASE) &&
 			GetExitCodeThread(hThread, &exitCode) &&
 			exitCode &&
 			CloseHandle(hThread);
 	}
+}
+
+uintptr_t MemEx::GetProcAddressEx(uintptr_t moduleBase, const char* procedureName, uint16_t* const pOrdinal)
+{
+	char buffer[0x1000];
+	if (!procedureName || !Read(moduleBase, buffer, 0x1000))
+		return 0;
+
+	PIMAGE_NT_HEADERS inth = reinterpret_cast<PIMAGE_NT_HEADERS>(buffer + *reinterpret_cast<DWORD*>(buffer + 0x3c));
+	bool image32 = inth->OptionalHeader.Magic == 0x10b;
+	PIMAGE_DATA_DIRECTORY idd = reinterpret_cast<PIMAGE_DATA_DIRECTORY>(reinterpret_cast<char*>(&inth->OptionalHeader) + (image32 ? 96 : 112));
+	
+	IMAGE_EXPORT_DIRECTORY ied;
+	if (!Read(moduleBase + idd->VirtualAddress, &ied, sizeof(IMAGE_EXPORT_DIRECTORY)))
+		return 0;
+
+	std::string procedureNameLowerCase = procedureName;
+	std::transform(procedureNameLowerCase.begin(), procedureNameLowerCase.end(), procedureNameLowerCase.begin(), [](TCHAR c) { return c >= 'A' && c < 'Z' ? c + 0x20 : c; });
+
+	SIZE_T numBytesRead;
+	const DWORD* b;
+	for (size_t i = 0; i < ied.NumberOfNames;)
+	{
+		ReadProcessMemory(m_hProcess, reinterpret_cast<LPVOID>(moduleBase + ied.AddressOfNames + i*4), buffer, 0x1000, &numBytesRead);
+		if (!numBytesRead)
+			return 0;
+
+		b = reinterpret_cast<DWORD*>(buffer);
+		for (; reinterpret_cast<const char*>(b) < buffer + numBytesRead * sizeof(DWORD) && i < ied.NumberOfNames; b++, i++)
+		{
+			char functionName[0x100]{ 0 };
+			ReadProcessMemory(m_hProcess, reinterpret_cast<LPCVOID>(moduleBase + *b), functionName, 0x100, NULL);
+
+			bool match = true;
+			for (int j = 0; j < procedureNameLowerCase.size(); j++)
+			{
+				char c = functionName[j];
+				if (!functionName[j] || (c >= 'A' && c <= 'Z' ? c + 0x20 : c) != procedureNameLowerCase.at(j))
+				{
+					match = false;
+					break;
+				}
+			}
+
+			if (match)
+			{
+				uint16_t functionOrdinal;
+				ReadProcessMemory(m_hProcess, reinterpret_cast<LPCVOID>(moduleBase + ied.AddressOfNameOrdinals + i * 2), &functionOrdinal, sizeof(uint16_t), NULL);
+				
+				if (pOrdinal)
+					*pOrdinal = functionOrdinal;
+
+				uintptr_t functionAddress = 0;
+				ReadProcessMemory(m_hProcess, reinterpret_cast<LPCVOID>(moduleBase + ied.AddressOfFunctions + static_cast<size_t>(functionOrdinal) * (image32 ? 4 : 8)), &functionAddress, sizeof(uint32_t), NULL);
+				functionAddress += moduleBase;
+
+				return functionAddress;
+			}
+		}
+		
+	}
+
+	return 0;
 }
 
 //Inspired by https://github.com/cheat-engine/cheat-engine/blob/ac072b6fae1e0541d9e54e2b86452507dde4689a/Cheat%20Engine/ceserver/native-api.c
