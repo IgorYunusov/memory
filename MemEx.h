@@ -756,13 +756,13 @@ public:
 	//Injects a dll into the opened process. If you choose to use
 	//manual mapping, it's recommended to compile in release mode.
 	//The function fails if 'injectionMethod' is LOAD_LIBRARY and
-	//'isPath' is false.
+	//'isPath' is false. The base of the injected module is returned
 	//Parameters:
 	//  dll             [in] See the 'isPath' parameter.
 	//  injectionMethod [in] The injection method.
 	//  isPath          [in] If true, 'dll' specifies the path to the dll,
 	//otherwise 'dll' is a pointer to the dll in memory.
-	bool Inject(const void* dll, INJECTION_METHOD injectionMethod = INJECTION_METHOD::LOAD_LIBRARY, bool isPath = true);
+	uintptr_t Inject(const void* dll, INJECTION_METHOD injectionMethod = INJECTION_METHOD::LOAD_LIBRARY, bool isPath = true);
 
 	//Retrieves the address of a function from the opened process.
 	//  moduleBase    [in]  The module's base on the opened process.

@@ -1014,95 +1014,30 @@ HANDLE MemEx::AllocateSharedMemory(const size_t size, PVOID& localView, PVOID& r
 
 bool MemEx::FreeSharedMemory(HANDLE hFileMapping, LPCVOID localView, LPCVOID remoteView) const { return UnmapLocalViewOfFile(localView) && UnmapRemoteViewOfFile(remoteView) && static_cast<bool>(CloseHandle(hFileMapping)); }
 
-struct ManualMappingData
+struct ManualMappingData64
 {
-	uintptr_t moduleBase;
-	HMODULE(__stdcall* loadLibraryA)(LPCSTR);
-	FARPROC(__stdcall* getProcAddress)(HMODULE, LPCSTR);
-	BOOL(__stdcall* virtualFree)(LPVOID, SIZE_T, DWORD);
-	BOOL(__stdcall* virtualProtect)(LPVOID, SIZE_T, DWORD, LPDWORD);
+	uint64_t moduleBase, loadLibraryA, getProcAddress;
 
-	ManualMappingData(uintptr_t moduleBase)
+	ManualMappingData64(uintptr_t moduleBase)
 		: moduleBase(moduleBase),
-		loadLibraryA(LoadLibraryA),
-		getProcAddress(GetProcAddress),
-		virtualFree(VirtualFree),
-		virtualProtect(VirtualProtect) {}
+		loadLibraryA(0),
+		getProcAddress(0) {}
 };
 
-bool __stdcall ManualMappingShellCode(ManualMappingData* manualMappingData)
+struct ManualMappingData32
 {
-	IMAGE_NT_HEADERS* h = reinterpret_cast<IMAGE_NT_HEADERS*>(manualMappingData->moduleBase + reinterpret_cast<IMAGE_DOS_HEADER*>(manualMappingData->moduleBase)->e_lfanew);
-	if (!h)
-		return false;
+	uint32_t moduleBase, loadLibraryA, getProcAddress;
 
-	ptrdiff_t deltaBase = static_cast<ptrdiff_t>(manualMappingData->moduleBase) - static_cast<ptrdiff_t>(h->OptionalHeader.ImageBase);
-	if (deltaBase && h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size)
-	{
-		IMAGE_BASE_RELOCATION* r = reinterpret_cast<IMAGE_BASE_RELOCATION*>(manualMappingData->moduleBase + h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
-		while (r->VirtualAddress)
-		{
-			WORD* pRelativeInfo = reinterpret_cast<WORD*>(r + 1);
-			for (UINT i = 0; i < ((r->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD)); ++i, ++pRelativeInfo)
-			{
-#ifdef _WIN64
-				if((*pRelativeInfo >> 0x0C) == IMAGE_REL_BASED_DIR64)
-#else
-				if((*pRelativeInfo >> 0x0C) == IMAGE_REL_BASED_HIGHLOW)
-#endif
-				{
-					ULONG_PTR* pPatch = reinterpret_cast<ULONG_PTR*>(manualMappingData->moduleBase + r->VirtualAddress + ((*pRelativeInfo) & 0xFFF));
-					*pPatch += deltaBase;
-				}
-			}
-			r = reinterpret_cast<IMAGE_BASE_RELOCATION*>(reinterpret_cast<uintptr_t>(r) + r->SizeOfBlock);
-		}
-	}
-	
-	if (h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size)
-	{
-		for(IMAGE_IMPORT_DESCRIPTOR* d = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(manualMappingData->moduleBase + h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress); d->Name; d++)
-		{
-			char* moduleName = reinterpret_cast<char*>(manualMappingData->moduleBase + d->Name);
-			HMODULE hModule = manualMappingData->loadLibraryA(moduleName);
-			if (!hModule)
-				return false;
+	ManualMappingData32(uintptr_t moduleBase)
+		: moduleBase(moduleBase),
+		loadLibraryA(0),
+		getProcAddress(0) {}
+};
 
-			ULONG_PTR* pThunkRef = reinterpret_cast<ULONG_PTR*>(manualMappingData->moduleBase + d->OriginalFirstThunk);
-			ULONG_PTR* pFuncRef = reinterpret_cast<ULONG_PTR*>(manualMappingData->moduleBase + d->FirstThunk);
-
-			if (!d->OriginalFirstThunk)
-				pThunkRef = pFuncRef;
-
-			for (; *pThunkRef; pThunkRef++, pFuncRef++)
-			{
-				if (IMAGE_SNAP_BY_ORDINAL(*pThunkRef))
-					*pFuncRef = reinterpret_cast<ULONG_PTR>(manualMappingData->getProcAddress(hModule, reinterpret_cast<char*>(*pThunkRef & 0xFFFF)));
-				else
-				{
-					IMAGE_IMPORT_BY_NAME* pImport = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(manualMappingData->moduleBase + (*pThunkRef));
-					*pFuncRef = reinterpret_cast<ULONG_PTR>(manualMappingData->getProcAddress(hModule, pImport->Name));
-				}
-			}
-		}
-	}
-	
-	if (h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size)
-	{
-		IMAGE_TLS_DIRECTORY* pTLS = reinterpret_cast<IMAGE_TLS_DIRECTORY*>(manualMappingData->moduleBase + h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
-		for (PIMAGE_TLS_CALLBACK* pCallback = reinterpret_cast<PIMAGE_TLS_CALLBACK*>(pTLS->AddressOfCallBacks); *pCallback; pCallback++)
-			(*pCallback)(reinterpret_cast<PVOID>(manualMappingData->moduleBase), DLL_PROCESS_ATTACH, nullptr);
-	}
-		
-	return reinterpret_cast<bool(__stdcall*)(HMODULE, DWORD, LPVOID)>(manualMappingData->moduleBase + h->OptionalHeader.AddressOfEntryPoint)(reinterpret_cast<HMODULE>(manualMappingData->moduleBase), DLL_PROCESS_ATTACH, NULL);
-}
-
-bool ManualMappingShellCodeEnd() { return true; }
-
-bool MemEx::Inject(const void* dll, INJECTION_METHOD injectionMethod, bool isPath)
+uintptr_t MemEx::Inject(const void* dll, INJECTION_METHOD injectionMethod, bool isPath)
 {
 	HANDLE hThread;
-	DWORD exitCode;
+	DWORD exitCode = 0;
 
 	if (injectionMethod == INJECTION_METHOD::MANUAL_MAPPING)
 	{
@@ -1133,22 +1068,20 @@ bool MemEx::Inject(const void* dll, INJECTION_METHOD injectionMethod, bool isPat
 			return false;
 
 		const IMAGE_NT_HEADERS* inth = reinterpret_cast<const IMAGE_NT_HEADERS*>(rawImage + idh->e_lfanew);
+		const IMAGE_OPTIONAL_HEADER32* ioh32 = reinterpret_cast<const IMAGE_OPTIONAL_HEADER32*>(&inth->OptionalHeader);
 		if (inth->Signature != 0x00004550 || inth->FileHeader.NumberOfSections > 96 || inth->FileHeader.SizeOfOptionalHeader == 0 || !(inth->FileHeader.Characteristics & (IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_DLL)))
 			return false;
 
-#ifdef _WIN64
-		if (inth->OptionalHeader.Magic != 0x20b)
-			return false;
-#else
+#ifndef _WIN64
 		if (inth->OptionalHeader.Magic != 0x10b)
 			return false;
 #endif
-		
+
 		//Try to allocate a buffer for the image.
 		LPVOID moduleBase = VirtualAllocEx(m_hProcess, NULL, inth->OptionalHeader.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
 		if (!moduleBase)
 			return false;
-		
+
 		//Copy headers
 		WriteProcessMemory(m_hProcess, moduleBase, rawImage, 0x1000, NULL);
 
@@ -1160,19 +1093,38 @@ bool MemEx::Inject(const void* dll, INJECTION_METHOD injectionMethod, bool isPat
 				WriteProcessMemory(m_hProcess, reinterpret_cast<LPVOID>(reinterpret_cast<uintptr_t>(moduleBase) + ish->VirtualAddress), rawImage + ish->PointerToRawData, ish->SizeOfRawData, NULL);
 		}
 
-		ManualMappingData manualMappingData(reinterpret_cast<uintptr_t>(moduleBase));
-		SIZE_T manualMappingShellCodeSize = static_cast<SIZE_T>(reinterpret_cast<ptrdiff_t>(ManualMappingShellCodeEnd) - reinterpret_cast<ptrdiff_t>(ManualMappingShellCode));
-		LPVOID manualMappingShellCodeAddress;
+		ManualMappingData64 manualMappingData64(reinterpret_cast<uintptr_t>(moduleBase));
+		ManualMappingData32 manualMappingData32(reinterpret_cast<uintptr_t>(moduleBase));
+		const char shellcode64[] = "\x48\x89\x5C\x24\x08\x48\x89\x6C\x24\x10\x48\x89\x74\x24\x18\x57\x41\x56\x41\x57\x48\x83\xEC\x20\x48\x8B\x01\x48\x8B\xD9\x4C\x63\x78\x3C\x4C\x03\xF8\x0F\x84\x78\x01\x00\x00\x4C\x8B\xD8\x4D\x2B\x5F\x30\x0F\x84\x8D\x00\x00\x00\x41\x83\xBF\xB4\x00\x00\x00\x00\x0F\x84\x7F\x00\x00\x00\x41\x8B\x97\xB0\x00\x00\x00\x48\x03\xD0\x83\x3A\x00\x74\x70\xBF\x00\xF0\x00\x00\xBE\x00\xA0\x00\x00\x90\x44\x8B\x52\x04\x4C\x8D\x42\x08\x45\x33\xC9\x49\x8D\x42\xF8\x48\xA9\xFE\xFF\xFF\xFF\x76\x43\x66\x0F\x1F\x84\x00\x00\x00\x00\x00\x41\x0F\xB7\x08\x0F\xB7\xC1\x66\x23\xC7\x66\x3B\xC6\x75\x11\x8B\x02\x81\xE1\xFF\x0F\x00\x00\x48\x03\xC8\x48\x03\x0B\x4C\x01\x19\x44\x8B\x52\x04\x41\xFF\xC1\x49\x83\xC0\x02\x41\x8B\xC1\x49\x8D\x4A\xF8\x48\xD1\xE9\x48\x3B\xC1\x72\xC6\x41\x8B\xC2\x48\x03\xD0\x83\x3A\x00\x75\x9B\x41\x83\xBF\x94\x00\x00\x00\x00\x74\x7E\x45\x8B\xB7\x90\x00\x00\x00\x4C\x03\x33\x41\x8B\x46\x0C\x85\xC0\x74\x6C\x8B\xC8\x48\x03\x0B\xFF\x53\x08\x48\x8B\xE8\x48\x85\xC0\x0F\x84\xAE\x00\x00\x00\x48\x8B\x13\x41\x8B\x4E\x10\x45\x8B\x06\x45\x85\xC0\x48\x8D\x34\x11\x41\x0F\x45\xC8\x48\x8D\x3C\x11\x48\x8B\x0C\x11\x48\x85\xC9\x74\x2A\x79\x05\x0F\xB7\xD1\xEB\x0A\x48\x8B\x13\x48\x83\xC2\x02\x48\x03\xD1\x48\x8B\xCD\xFF\x53\x10\x48\x83\xC7\x08\x48\x89\x06\x48\x83\xC6\x08\x48\x8B\x0F\x48\x85\xC9\x75\xD6\x41\x8B\x46\x20\x49\x83\xC6\x14\x85\xC0\x75\x94\x41\x83\xBF\xD4\x00\x00\x00\x00\x74\x32\x48\x8B\x03\x41\x8B\x8F\xD0\x00\x00\x00\x48\x8B\x7C\x01\x18\x48\x8B\x07\x48\x85\xC0\x74\x1B\x66\x90\x48\x8B\x0B\x45\x33\xC0\x41\x8D\x50\x01\xFF\xD0\x48\x8B\x47\x08\x48\x8D\x7F\x08\x48\x85\xC0\x75\xE7\x48\x8B\x0B\x45\x33\xC0\x41\x8B\x47\x28\x48\x03\xC1\x41\x8D\x50\x01\xFF\xD0\x85\xC0\x0F\x95\xC0\xEB\x02\x32\xC0\x48\x8B\x5C\x24\x40\x48\x8B\x6C\x24\x48\x48\x8B\x74\x24\x50\x48\x83\xC4\x20\x41\x5F\x41\x5E\x5F\xC3";
+		const char shellcode32[] = "\x55\x8B\xEC\x83\xEC\x08\x53\x8B\x5D\x08\x56\x57\x8B\x0B\x8B\x79\x3C\x03\xF9\x89\x7D\x08\x0F\x84\x35\x01\x00\x00\x8B\xC1\x2B\x47\x34\x89\x45\xF8\x74\x67\x83\xBF\xA4\x00\x00\x00\x00\x74\x5E\x8B\x97\xA0\x00\x00\x00\x03\xD1\x83\x3A\x00\x74\x51\x0F\x1F\x40\x00\x8B\x4A\x04\x8D\x72\x08\x33\xFF\x8D\x41\xF8\xA9\xFE\xFF\xFF\xFF\x76\x31\x0F\xB7\x06\x8B\xC8\x81\xE1\x00\xF0\x00\x00\x81\xF9\x00\x30\x00\x00\x75\x0E\x8B\x4D\xF8\x25\xFF\x0F\x00\x00\x03\x02\x03\x03\x01\x08\x8B\x4A\x04\x47\x83\xC6\x02\x8D\x41\xF8\xD1\xE8\x3B\xF8\x72\xCF\x03\xD1\x83\x3A\x00\x75\xB6\x8B\x7D\x08\x83\xBF\x84\x00\x00\x00\x00\x74\x77\x8B\xBF\x80\x00\x00\x00\x03\x3B\x89\x7D\xF8\x8B\x4F\x0C\x85\xC9\x74\x62\x8B\x03\x03\xC1\x50\x8B\x43\x04\xFF\xD0\x89\x45\xFC\x85\xC0\x0F\x84\x94\x00\x00\x00\x8B\x33\x8B\x0F\x85\xC9\x8B\x57\x10\x8D\x3C\x32\x0F\x45\xD1\x8B\x0C\x16\x03\xF2\x85\xC9\x74\x25\x79\x05\x0F\xB7\xC1\xEB\x07\x8B\x03\x83\xC0\x02\x03\xC1\x50\xFF\x75\xFC\x8B\x43\x08\xFF\xD0\x83\xC6\x04\x89\x07\x83\xC7\x04\x8B\x0E\x85\xC9\x75\xDB\x8B\x7D\xF8\x83\xC7\x14\x89\x7D\xF8\x8B\x4F\x0C\x85\xC9\x75\x9E\x8B\x7D\x08\x83\xBF\xC4\x00\x00\x00\x00\x74\x24\x8B\x03\x8B\x8F\xC0\x00\x00\x00\x8B\x74\x01\x0C\x8B\x06\x85\xC0\x74\x12\x6A\x00\x6A\x01\xFF\x33\xFF\xD0\x8B\x46\x04\x8D\x76\x04\x85\xC0\x75\xEE\x8B\x0B\x8B\x47\x28\x6A\x00\x6A\x01\x51\x03\xC1\xFF\xD0\x5F\x5E\x5B\x8B\xE5\x5D\xC2\x04\x00\x5F\x5E\x32\xC0\x5B\x8B\xE5\x5D\xC2\x04";
+		SIZE_T shellcodeSize, manualMappingDataSize;
 
-		return (manualMappingShellCodeAddress = VirtualAllocEx(m_hProcess, NULL, manualMappingShellCodeSize + sizeof(ManualMappingData), MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) &&
-			WriteProcessMemory(m_hProcess, manualMappingShellCodeAddress, ManualMappingShellCode, manualMappingShellCodeSize, NULL) &&
-			WriteProcessMemory(m_hProcess, reinterpret_cast<LPVOID>(reinterpret_cast<uintptr_t>(manualMappingShellCodeAddress) + manualMappingShellCodeSize), &manualMappingData, sizeof(ManualMappingData), NULL) &&
-			(hThread = CreateRemoteThread(m_hProcess, NULL, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(manualMappingShellCodeAddress), reinterpret_cast<LPVOID>(reinterpret_cast<uintptr_t>(manualMappingShellCodeAddress) + manualMappingShellCodeSize), NULL, NULL)) &&
+		if (m_isWow64)
+		{
+			shellcodeSize = sizeof(shellcode32), manualMappingDataSize = sizeof(manualMappingData32);
+			auto kernel32 = GetModuleBase(TEXT("kernel32.dll"));
+			manualMappingData32.loadLibraryA = GetProcAddressEx(kernel32, "LoadLibraryA");
+			manualMappingData32.getProcAddress = GetProcAddressEx(kernel32, "GetProcAddress");
+		}
+		else
+		{
+			shellcodeSize = sizeof(shellcode64), manualMappingDataSize = sizeof(manualMappingData64);
+			manualMappingData64.loadLibraryA = reinterpret_cast<uint64_t>(LoadLibraryA);
+			manualMappingData64.getProcAddress = reinterpret_cast<uint64_t>(GetProcAddress);
+		}
+
+		LPVOID manualMappingShellCodeAddress;
+		bool success = (manualMappingShellCodeAddress = VirtualAllocEx(m_hProcess, NULL, shellcodeSize + manualMappingDataSize, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) &&
+			WriteProcessMemory(m_hProcess, manualMappingShellCodeAddress, reinterpret_cast<LPCVOID>(m_isWow64 ? shellcode32 : shellcode64), shellcodeSize, NULL) &&
+			WriteProcessMemory(m_hProcess, reinterpret_cast<LPVOID>(reinterpret_cast<uintptr_t>(manualMappingShellCodeAddress) + shellcodeSize), m_isWow64 ? reinterpret_cast<LPCVOID>(&manualMappingData32) : reinterpret_cast<LPCVOID>(&manualMappingData64), manualMappingDataSize, NULL) &&
+			(hThread = CreateRemoteThread(m_hProcess, NULL, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(manualMappingShellCodeAddress), reinterpret_cast<LPVOID>(reinterpret_cast<uintptr_t>(manualMappingShellCodeAddress) + shellcodeSize), NULL, NULL)) &&
 			WaitForSingleObject(hThread, INFINITE) != WAIT_FAILED &&
 			VirtualFreeEx(m_hProcess, manualMappingShellCodeAddress, 0, MEM_RELEASE) &&
 			GetExitCodeThread(hThread, &exitCode) &&
 			exitCode &&
 			CloseHandle(hThread);
+
+		return success ? reinterpret_cast<uintptr_t>(moduleBase) : VirtualFreeEx(m_hProcess, moduleBase, 0, MEM_RELEASE) && 0;
 	}
 	else
 	{
@@ -1190,7 +1142,7 @@ bool MemEx::Inject(const void* dll, INJECTION_METHOD injectionMethod, bool isPat
 			));
 		}
 		
-		return isPath &&
+		bool success = isPath &&
 			(lpAddress = VirtualAllocEx(m_hProcess, NULL, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) &&
 			WriteProcessMemory(m_hProcess, lpAddress, dll, (static_cast<size_t>(lstrlen(reinterpret_cast<const TCHAR*>(dll))) + 1) * sizeof(TCHAR), nullptr) &&
 			(hThread = CreateRemoteThread(m_hProcess, NULL, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(loadLibrary), lpAddress, NULL, NULL)) &&
@@ -1199,6 +1151,8 @@ bool MemEx::Inject(const void* dll, INJECTION_METHOD injectionMethod, bool isPat
 			GetExitCodeThread(hThread, &exitCode) &&
 			exitCode &&
 			CloseHandle(hThread);
+
+		return success ? exitCode : 0;
 	}
 }
 
@@ -1618,3 +1572,72 @@ void MemEx::DeleteRemoteThread()
 	CloseHandle(m_hThread);
 	m_hThread = NULL;
 }
+
+/*
+bool __stdcall ManualMappingShellCode(ManualMappingData* manualMappingData)
+{
+	IMAGE_NT_HEADERS* h = reinterpret_cast<IMAGE_NT_HEADERS*>(manualMappingData->moduleBase + reinterpret_cast<IMAGE_DOS_HEADER*>(manualMappingData->moduleBase)->e_lfanew);
+	if (!h)
+		return false;
+
+	ptrdiff_t deltaBase = static_cast<ptrdiff_t>(manualMappingData->moduleBase) - static_cast<ptrdiff_t>(h->OptionalHeader.ImageBase);
+	if (deltaBase && h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size)
+	{
+		IMAGE_BASE_RELOCATION* r = reinterpret_cast<IMAGE_BASE_RELOCATION*>(manualMappingData->moduleBase + h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
+		while (r->VirtualAddress)
+		{
+			WORD* pRelativeInfo = reinterpret_cast<WORD*>(r + 1);
+			for (UINT i = 0; i < ((r->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD)); ++i, ++pRelativeInfo)
+			{
+#ifdef _WIN64
+				if ((*pRelativeInfo >> 0x0C) == IMAGE_REL_BASED_DIR64)
+#else
+				if ((*pRelativeInfo >> 0x0C) == IMAGE_REL_BASED_HIGHLOW)
+#endif
+				{
+					ULONG_PTR* pPatch = reinterpret_cast<ULONG_PTR*>(manualMappingData->moduleBase + r->VirtualAddress + ((*pRelativeInfo) & 0xFFF));
+					*pPatch += deltaBase;
+				}
+			}
+			r = reinterpret_cast<IMAGE_BASE_RELOCATION*>(reinterpret_cast<uintptr_t>(r) + r->SizeOfBlock);
+		}
+	}
+
+	if (h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size)
+	{
+		for (IMAGE_IMPORT_DESCRIPTOR* d = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(manualMappingData->moduleBase + h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress); d->Name; d++)
+		{
+			char* moduleName = reinterpret_cast<char*>(manualMappingData->moduleBase + d->Name);
+			HMODULE hModule = manualMappingData->loadLibraryA(moduleName);
+			if (!hModule)
+				return false;
+
+			ULONG_PTR* pThunkRef = reinterpret_cast<ULONG_PTR*>(manualMappingData->moduleBase + d->OriginalFirstThunk);
+			ULONG_PTR* pFuncRef = reinterpret_cast<ULONG_PTR*>(manualMappingData->moduleBase + d->FirstThunk);
+
+			if (!d->OriginalFirstThunk)
+				pThunkRef = pFuncRef;
+
+			for (; *pThunkRef; pThunkRef++, pFuncRef++)
+			{
+				if (IMAGE_SNAP_BY_ORDINAL(*pThunkRef))
+					*pFuncRef = reinterpret_cast<ULONG_PTR>(manualMappingData->getProcAddress(hModule, reinterpret_cast<char*>(*pThunkRef & 0xFFFF)));
+				else
+				{
+					IMAGE_IMPORT_BY_NAME* pImport = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(manualMappingData->moduleBase + (*pThunkRef));
+					*pFuncRef = reinterpret_cast<ULONG_PTR>(manualMappingData->getProcAddress(hModule, pImport->Name));
+				}
+			}
+		}
+	}
+
+	if (h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size)
+	{
+		IMAGE_TLS_DIRECTORY* pTLS = reinterpret_cast<IMAGE_TLS_DIRECTORY*>(manualMappingData->moduleBase + h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
+		for (PIMAGE_TLS_CALLBACK* pCallback = reinterpret_cast<PIMAGE_TLS_CALLBACK*>(pTLS->AddressOfCallBacks); *pCallback; pCallback++)
+			(*pCallback)(reinterpret_cast<PVOID>(manualMappingData->moduleBase), DLL_PROCESS_ATTACH, nullptr);
+	}
+
+	return reinterpret_cast<BOOL(*WINAPI)(HINSTANCE, DWORD, LPVOID)>(manualMappingData->moduleBase + h->OptionalHeader.AddressOfEntryPoint)(reinterpret_cast<HINSTANCE>(manualMappingData->moduleBase), DLL_PROCESS_ATTACH, 0);
+}
+*/
