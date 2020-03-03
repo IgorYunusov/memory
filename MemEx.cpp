@@ -1133,7 +1133,7 @@ uintptr_t MemEx::Inject(const void* dll, INJECTION_METHOD injectionMethod, bool 
 		LPVOID loadLibrary = LoadLibrary;
 		if (m_isWow64)
 		{
-			loadLibrary = reinterpret_cast<LPVOID>(GetProcAddressEx(GetModuleBase("kernel32.dll"),
+			loadLibrary = reinterpret_cast<LPVOID>(GetProcAddressEx(GetModuleBase(TEXT("kernel32.dll")),
 #ifdef UNICODE
 				"LoadLibraryW"
 #else
