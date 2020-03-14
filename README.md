@@ -7,9 +7,6 @@ There is an internal (MemIn.h", "MemIn.cpp") and an external ("MemEx.h", "MemEx.
 - Which files do I have to include in my project?
   - If you want to interact with another process, use `MemEx.h` and `MemEx.cpp`. If you want to interact with the virtual address space that your code is running on, use `MemIn.h` and `MemIn.cpp`.  You can even use both at the same time!
   
-- MemEx::Inject() fails when attempting to inject a dll using manual mapping.
-  - TL;DR `Use Release mode`. See this issue: https://github.com/Nomade040/memory/issues/5.
-
 # Features
 **[EX]** = Function is only available on the external version
  - x86-32 & x86-64 support
